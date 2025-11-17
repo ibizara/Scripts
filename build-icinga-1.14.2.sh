@@ -59,7 +59,7 @@ ensure_nagios_user_group() {
       uid="${gid}"
     fi
     echo "Creating user 'nagios' with UID=${uid}, GID=${gid}"
-    useradd -u "${uid}" -g "${gid}" -d /var/lib/icinga -s /usr/sbin/nologin nagios
+    useradd -r -u "${uid}" -g "${gid}" -d /var/lib/icinga -s /usr/sbin/nologin nagios
   fi
 
   # Ensure www-data is in the 'nagios' group (for external command pipe access)
@@ -90,8 +90,8 @@ echo "=== Installing build and runtime dependencies ==="
 apt-get update
 apt-get install -y git build-essential autoconf automake libtool pkg-config \
   libgd-dev libjpeg-dev libpng-dev libssl-dev zlib1g-dev \
-  apache2 apache2-utils monitoring-plugins
-  # use monitoring-plugins-basic for a minimal set
+  apache2 apache2-utils monitoring-plugins-basic
+  # use monitoring-plugins for additional plugins
 
 ### 3. FETCH SOURCE ##########################################################
 
@@ -118,14 +118,27 @@ CFLAGS="-O2 -g -fcommon -Dsmb_snprintf=snprintf -Dsmb_vsnprintf=vsnprintf" \
 ./configure \
   --prefix=/usr \
   --sysconfdir=/etc/icinga \
-  --localstatedir=/var \
+  --localstatedir=/var/lib/icinga \
+  --datarootdir=/usr/share/icinga \
+  --bindir=/usr/bin \
+  --sbindir=/usr/lib/cgi-bin/icinga \
+  --libdir=/usr/lib \
+  --libexecdir=/usr/lib/nagios/plugins \
   --with-icinga-user=nagios \
   --with-icinga-group=nagios \
   --with-command-user=www-data \
   --with-command-group=nagios \
   --with-log-dir=/var/log/icinga \
   --with-checkresult-dir=/var/lib/icinga/spool/checkresults \
+  --with-temp-dir=/var/lib/icinga/tmp \
+  --with-temp-file=/var/lib/icinga/icinga.tmp \
+  --with-ext-cmd-file-dir=/var/lib/icinga/rw \
+  --with-lockfile=/var/lib/icinga/icinga.lock \
+  --with-icinga-chkfile=/var/lib/icinga/icinga.chk \
   --with-httpd-conf=/etc/apache2/conf-available \
+  --with-cgiurl=/icinga/cgi-bin \
+  --with-htmurl=/icinga \
+  --with-mainurl='/icinga/cgi-bin/status.cgi?host=all&style=detail&sortobject=services&sorttype=2&sortoption=3' \
   --disable-idoutils
 
 ### 5. BUILD #################################################################
@@ -145,34 +158,24 @@ make install-html
 echo "=== Installing upstream config to /etc/icinga ==="
 make install-config CFGDIR=/etc/icinga INSTALL_OPTS="-o nagios -g nagios"
 
-echo "=== Normalising icinga.cfg paths to Debian-style layout under /var ==="
+echo "=== Setting date format to European style ==="
 sed -i \
- -e 's|^log_file=.*|log_file=/var/log/icinga/icinga.log|' \
- -e 's|^object_cache_file=.*|object_cache_file=/var/lib/icinga/objects.cache|' \
- -e 's|^precached_object_file=.*|precached_object_file=/var/lib/icinga/objects.precache|' \
- -e 's|^status_file=.*|status_file=/var/lib/icinga/status.dat|' \
- -e 's|^command_file=.*|command_file=/var/lib/icinga/rw/icinga.cmd|' \
- -e 's|^check_result_path=.*|check_result_path=/var/lib/icinga/spool/checkresults|' \
- -e 's|^lock_file=.*|lock_file=/var/lib/icinga/icinga.lock|' \
- -e 's|^temp_file=.*|temp_file=/var/lib/icinga/icinga.tmp|' \
- -e 's|^temp_path=.*|temp_path=/var/lib/icinga/tmp|' \
- -e 's|^state_retention_file=.*|state_retention_file=/var/lib/icinga/retention.dat|' \
  -e 's|^date_format=.*|date_format=euro|' \
- /etc/icinga/icinga.cfg
-
-echo "=== Fixing plugin path in resource.cfg ==="
-sed -i 's|^.*USER1.*|$USER1$=/usr/lib/nagios/plugins|' /etc/icinga/resource.cfg
+/etc/icinga/icinga.cfg
 
 echo "=== Fixing /etc/icinga ownership and permissions ==="
 chown -R root:nagios /etc/icinga
 find /etc/icinga -type f -exec chmod 640 {} \;
 chmod 750 /etc/icinga
 
+echo "=== Installing p1.pl into /usr/lib ==="
+install -m 755 -o root -g nagios /usr/local/src/icinga-core/p1.pl /usr/lib/p1.pl
+
 ### 8. DIRECTORIES UNDER /var ################################################
 
 echo "=== Ensuring /var/lib/icinga and /var/log/icinga exist ==="
 install -d -m 775 -o nagios -g nagios /var/lib/icinga
-install -d -m 775 -o nagios -g nagios /var/lib/icinga/rw
+install -d -m 775 -o www-data -g nagios /var/lib/icinga/rw
 install -d -m 775 -o nagios -g nagios /var/lib/icinga/tmp
 install -d -m 775 -o nagios -g nagios /var/lib/icinga/spool/checkresults
 install -d -m 755 -o nagios -g nagios /var/log/icinga
@@ -180,9 +183,7 @@ install -d -m 755 -o nagios -g nagios /var/log/icinga
 ### 9. COMMANDMODE + APACHE ##################################################
 
 echo "=== Installing commandmode (external command pipe) ==="
-make install-commandmode \
-  EXTCMDFILEDIR=/var/lib/icinga/rw \
-  COMMAND_OPTS="-o www-data -g nagios"
+make install-commandmode
 
 echo "=== Installing Apache web config ==="
 make install-webconf
@@ -216,10 +217,6 @@ User=nagios
 Group=nagios
 EnvironmentFile=-/etc/default/icinga
 
-# Create /run/icinga automatically
-RuntimeDirectory=icinga
-RuntimeDirectoryMode=0755
-
 # Validate config before startup
 ExecStartPre=/usr/bin/icinga $ICINGA_VERIFY_OPTS
 
@@ -237,7 +234,7 @@ systemctl daemon-reload
 ### 12. PRE-FLIGHT CHECK #####################################################
 
 echo "=== Running pre-flight check as nagios ==="
-sudo -u nagios /usr/bin/icinga -v /etc/icinga/icinga.cfg
+su -s /bin/sh -c '/usr/bin/icinga -v /etc/icinga/icinga.cfg' nagios
 
 ### 13. ENABLE + START SERVICE ###############################################
 
